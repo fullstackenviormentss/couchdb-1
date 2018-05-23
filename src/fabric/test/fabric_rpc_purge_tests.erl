@@ -21,6 +21,7 @@
 
 % TODO: Add tests:
 %         - filter some updates
+%         - allow for an update that was filtered by a node
 %         - ignore lagging nodes
 
 main_test_() ->
@@ -44,12 +45,21 @@ main_test_() ->
                 fun teardown_single_purge/1,
                 lists:map(fun wrap/1, [
                     ?TDEF(t_filter),
-                    ?TDEF(t_no_filter_interactive_edit),
-                    ?TDEF(t_no_filter_unknown_node),
+                    ?TDEF(t_filter_unknown_node),
                     ?TDEF(t_no_filter_old_node),
                     ?TDEF(t_no_filter_different_node),
-                    ?TDEF(t_no_filter_different_docid),
-                    ?TDEF(t_no_filter_different_rev),
+                    ?TDEF(t_no_filter_after_repl)
+                ])
+            },
+            {
+                foreach,
+                fun setup_multi_purge/0,
+                fun teardown_multi_purge/1,
+                lists:map(fun wrap/1, [
+                    ?TDEF(t_filter),
+                    ?TDEF(t_filter_unknown_node),
+                    ?TDEF(t_no_filter_old_node),
+                    ?TDEF(t_no_filter_different_node),
                     ?TDEF(t_no_filter_after_repl)
                 ])
             }
@@ -80,11 +90,26 @@ setup_single_purge() ->
     DocId = <<"0003">>,
     {ok, OldDoc} = open_doc(DbName, DocId),
     purge_doc(DbName, DocId),
-    {DbName, DocId, OldDoc}.
+    {DbName, DocId, OldDoc, 1}.
 
 
-teardown_single_purge({DbName, _, _}) ->
+teardown_single_purge({DbName, _, _, _}) ->
     teardown_no_purge(DbName).
+
+
+setup_multi_purge() ->
+    DbName = setup_no_purge(),
+    DocId = <<"0003">>,
+    {ok, OldDoc} = open_doc(DbName, DocId),
+    lists:foreach(fun(I) ->
+        PDocId = iolist_to_binary(io_lib:format("~4..0b", [I])),
+        purge_doc(DbName, PDocId)
+    end, lists:seq(1, 5)),
+    {DbName, DocId, OldDoc, 3}.
+
+
+teardown_multi_purge(Ctx) ->
+    teardown_single_purge(Ctx).
 
 
 t_no_purge_no_filter(DbName) ->
@@ -100,7 +125,7 @@ t_no_purge_no_filter(DbName) ->
     ?assert(CurrDoc == NewDoc).
 
 
-t_filter({DbName, DocId, OldDoc}) ->
+t_filter({DbName, DocId, OldDoc, _PSeq}) ->
     ?assertEqual({not_found, missing}, open_doc(DbName, DocId)),
     create_purge_checkpoint(DbName, 0),
 
@@ -109,24 +134,21 @@ t_filter({DbName, DocId, OldDoc}) ->
     ?assertEqual({not_found, missing}, open_doc(DbName, DocId)).
 
 
-t_no_filter_interactive_edit(_) ->
-    ok.
-
-
-t_no_filter_unknown_node({DbName, DocId, OldDoc}) ->
+t_filter_unknown_node({DbName, DocId, OldDoc, _PSeq}) ->
+    % Unknown nodes are assumed to start at PurgeSeq = 0
     ?assertEqual({not_found, missing}, open_doc(DbName, DocId)),
     create_purge_checkpoint(DbName, 0),
 
     {Pos, [Rev | _]} = OldDoc#doc.revs,
-    RROpt = {read_repair, [{'blargh@127.0.0.1', {DocId, [{Pos, Rev}]}}]},
+    RROpt = {read_repair, [{'blargh@127.0.0.1', [{Pos, Rev}]}]},
     rpc_update_doc(DbName, OldDoc, [RROpt]),
 
-    ?assertEqual({ok, OldDoc}, open_doc(DbName, DocId)).
+    ?assertEqual({not_found, missing}, open_doc(DbName, DocId)).
 
 
-t_no_filter_old_node({DbName, DocId, OldDoc}) ->
+t_no_filter_old_node({DbName, DocId, OldDoc, PSeq}) ->
     ?assertEqual({not_found, missing}, open_doc(DbName, DocId)),
-    create_purge_checkpoint(DbName, 1),
+    create_purge_checkpoint(DbName, PSeq),
 
     % The random UUID is to generate a badarg exception when
     % we try and convert it to an existing atom.
@@ -137,9 +159,9 @@ t_no_filter_old_node({DbName, DocId, OldDoc}) ->
     ?assertEqual({ok, OldDoc}, open_doc(DbName, DocId)).
 
 
-t_no_filter_different_node({DbName, DocId, OldDoc}) ->
+t_no_filter_different_node({DbName, DocId, OldDoc, PSeq}) ->
     ?assertEqual({not_found, missing}, open_doc(DbName, DocId)),
-    create_purge_checkpoint(DbName, 1),
+    create_purge_checkpoint(DbName, PSeq),
 
     % Create a valid purge for a different node
     TgtNode = list_to_binary(atom_to_list('notfoo@127.0.0.1')),
@@ -150,37 +172,9 @@ t_no_filter_different_node({DbName, DocId, OldDoc}) ->
     ?assertEqual({ok, OldDoc}, open_doc(DbName, DocId)).
 
 
-% This really shows that I should rewrite how read_repair
-% works as we'll never actually call this with different
-% doc ids or even multiple docids
-t_no_filter_different_docid({DbName, DocId, OldDoc}) ->
+t_no_filter_after_repl({DbName, DocId, OldDoc, PSeq}) ->
     ?assertEqual({not_found, missing}, open_doc(DbName, DocId)),
-    create_purge_checkpoint(DbName, 0),
-
-    {Pos, [Rev | _]} = OldDoc#doc.revs,
-    RROpt = {read_repair, [{tgt_node(), {<<"bang">>, [{Pos, Rev}]}}]},
-    rpc_update_doc(DbName, OldDoc, [RROpt]),
-
-    ?assertEqual({ok, OldDoc}, open_doc(DbName, DocId)).
-
-
-% Similar to the different docid rev we're not going to be
-% passing a different doc update with a different revision
-% to the read_repair function
-t_no_filter_different_rev({DbName, DocId, OldDoc}) ->
-    ?assertEqual({not_found, missing}, open_doc(DbName, DocId)),
-    create_purge_checkpoint(DbName, 0),
-
-    Rev = crypto:hash(md5, couch_uuids:random()),
-    RROpt = {read_repair, [{tgt_node(), {DocId, [{3, Rev}]}}]},
-    rpc_update_doc(DbName, OldDoc, [RROpt]),
-
-    ?assertEqual({ok, OldDoc}, open_doc(DbName, DocId)).
-
-
-t_no_filter_after_repl({DbName, DocId, OldDoc}) ->
-    ?assertEqual({not_found, missing}, open_doc(DbName, DocId)),
-    create_purge_checkpoint(DbName, 1),
+    create_purge_checkpoint(DbName, PSeq),
 
     rpc_update_doc(DbName, OldDoc),
 
@@ -259,15 +253,11 @@ create_purge_checkpoint(DbName, PurgeSeq, TgtNode) when is_binary(TgtNode) ->
 
 rpc_update_doc(DbName, Doc) ->
     {Pos, [Rev | _]} = Doc#doc.revs,
-    RROpt = {read_repair, [{tgt_node(), {Doc#doc.id, [{Pos, Rev}]}}]},
+    RROpt = {read_repair, [{tgt_node(), [{Pos, Rev}]}]},
     rpc_update_doc(DbName, Doc, [RROpt]).
 
 
-rpc_update_doc(DbName, Doc, Opts0) ->
-    Opts = case lists:member(interactive_edit, Opts0) of
-        true -> Opts0;
-        false -> [replicated_changes | Opts0]
-    end,
+rpc_update_doc(DbName, Doc, Opts) ->
     Ref = erlang:make_ref(),
     put(rexi_from, {self(), Ref}),
     fabric_rpc:update_docs(DbName, [Doc], Opts),

@@ -240,19 +240,19 @@ get_missing_revs(DbName, IdRevsList, Options) ->
     end).
 
 update_docs(DbName, Docs0, Options) ->
-    X = case proplists:get_value(replicated_changes, Options) of
-        true -> replicated_changes;
-        _ -> interactive_edit
-    end,
-    NodeIdRevs = couch_util:get_value(read_repair, Options),
-    Docs1 = case {X, is_list(NodeIdRevs)} of
-        {replicated_changes, true} ->
-            read_repair_filter(DbName, NodeIdRevs, Docs0, Options);
-        _ ->
-            Docs0
+    {Docs1, Type} = case couch_util:get_value(read_repair, Options) of
+        NodeRevs when is_list(NodeRevs) ->
+            Filtered = read_repair_filter(DbName, Docs0, NodeRevs, Options),
+            {Filtered, replicated_changes};
+        undefined ->
+            X = case proplists:get_value(replicated_changes, Options) of
+                true -> replicated_changes;
+                _ -> interactive_edit
+            end,
+            {Docs0, X}
     end,
     Docs2 = make_att_readers(Docs1),
-    with_db(DbName, Options, {couch_db, update_docs, [Docs2, Options, X]}).
+    with_db(DbName, Options, {couch_db, update_docs, [Docs2, Options, Type]}).
 
 
 get_purge_seq(DbName, Options) ->
@@ -315,12 +315,12 @@ with_db(DbName, Options, {M,F,A}) ->
     end.
 
 
-read_repair_filter(DbName, NodeIdRevs, Docs, Options) ->
+read_repair_filter(DbName, Docs, NodeRevs, Options) ->
     set_io_priority(DbName, Options),
     case get_or_create_db(DbName, Options) of
         {ok, Db} ->
             try
-                filter_purged_revs(Db, NodeIdRevs, Docs)
+                read_repair_filter(Db, Docs, NodeRevs)
             after
                 couch_db:close(Db)
             end;
@@ -342,93 +342,74 @@ read_repair_filter(DbName, NodeIdRevs, Docs, Options) ->
 % need to look at the purge infos that we have locally but
 % have not yet sent to the remote copy.
 %
-% NodeIdRevs are the list of {node(), {docid(), [rev()]}}
-% tuples passed as the read_repair option to update_docs.
-filter_purged_revs(Db, NodeIdRevs, Docs) ->
-    Nodes0 = [Node || {Node, _IdRevs} <- NodeIdRevs, Node /= node()],
-    Nodes = lists:usort(Nodes0),
+% NodeRevs is a list of the {node(), [rev()]} tuples passed
+% as the read_repair option to update_docs.
+read_repair_filter(Db, Docs, NodeRevs) ->
+    [#doc{id = DocId} | _] = Docs,
+    Nodes = lists:usort([Node || {Node, _} <- NodeRevs, Node /= node()]),
+    NodeSeqs = get_node_seqs(Db, Nodes),
 
+    {ok, DbPSeq} = couch_db:get_purge_seq(Db),
+    Lag = config:get_integer("couchdb", "read_repair_lag", 100),
+
+    % Filter out read-repair updates from any node that is
+    % so out of date that it would force us to scan a large
+    % number of purge infos
+    NodeFiltFun = fun({Node, _Revs}) ->
+        {Node, NodeSeq} = lists:keyfind(Node, 1, NodeSeqs),
+        NodeSeq >= DbPSeq - Lag
+    end,
+    RecentNodeRevs = lists:filter(NodeFiltFun, NodeRevs),
+
+    % For each node we scan the purge infos to filter out any
+    % revisions that have been locally purged since we last
+    % replicated to the remote node's shard copy.
+    AllowableRevs = lists:foldl(fun({Node, Revs}, RevAcc) ->
+        {Node, StartSeq} = lists:keyfind(Node, 1, NodeSeqs),
+        FoldFun = fun({_PSeq, _UUID, PDocId, PRevs}, InnerAcc) ->
+            if PDocId /= DocId -> {ok, InnerAcc}; true ->
+                {ok, InnerAcc -- PRevs}
+            end
+        end,
+        {ok, FiltRevs} = couch_db:fold_purge_infos(Db, StartSeq, FoldFun, Revs),
+        lists:usort(FiltRevs ++ RevAcc)
+    end, [], RecentNodeRevs),
+
+    % Finally, filter the doc updates to only include revisions
+    % that have not been purged locally.
+    DocFiltFun = fun(#doc{revs = {Pos, [Rev | _]}}) ->
+        lists:member({Pos, Rev}, AllowableRevs)
+    end,
+    lists:filter(DocFiltFun, Docs).
+
+
+get_node_seqs(Db, Nodes) ->
     % Gather the list of {Node, PurgeSeq} pairs for all nodes
     % that are present in our read repair group
-    StartKey = <<?LOCAL_DOC_PREFIX, "/purge-mem3-">>,
-    Opts = [{start_key, StartKey}],
     FoldFun = fun(#doc{id = Id, body = {Props}}, Acc) ->
         case Id of
             <<?LOCAL_DOC_PREFIX, "purge-mem3-", _/binary>> ->
-                TargetNodeBin = couch_util:get_value(<<"target_node">>, Props),
+                TgtNode = couch_util:get_value(<<"target_node">>, Props),
                 PurgeSeq = couch_util:get_value(<<"purge_seq">>, Props),
-                try
-                    TargetNode = binary_to_existing_atom(TargetNodeBin, latin1),
-                    case lists:member(TargetNode, Nodes) of
-                        true ->
-                            {ok, [{TargetNode, PurgeSeq} | Acc]};
-                        false ->
-                            {ok, Acc}
-                    end
-                catch error:badarg ->
-                    % A really old doc referring to a node that's
-                    % no longer in the cluster
-                    {ok, Acc}
+                case lists:keyfind(TgtNode, 1, Acc) of
+                    {_, OldSeq} ->
+                        NewSeq = erlang:max(OldSeq, PurgeSeq),
+                        NewEntry = {TgtNode, NewSeq},
+                        NewAcc = lists:keyreplace(TgtNode, 1, Acc, NewEntry),
+                        {ok, NewAcc};
+                    false ->
+                        {ok, Acc}
                 end;
             _ ->
                 % We've processed all _local mem3 purge docs
                 {stop, Acc}
         end
     end,
-    {ok, NodeSeqs} = couch_db:fold_local_docs(Db, FoldFun, [], Opts),
+    InitAcc = [{list_to_binary(atom_to_list(Node)), 0} || Node <- Nodes],
+    Opts = [{start_key, <<?LOCAL_DOC_PREFIX, "/purge-mem3-">>}],
+    {ok, NodeBinSeqs} = couch_db:fold_local_docs(Db, FoldFun, InitAcc, Opts),
+    [{list_to_existing_atom(binary_to_list(N)), S} || {N, S} <- NodeBinSeqs].
 
-    {ok, DbPSeq} = couch_db:get_purge_seq(Db),
-    Lag = config:get_integer("couchdb", "read_repair_lag", 100),
-
-    CheckSeqFun = fun({Node, IdRevs}, {GoodToGo, MaybeGood}) ->
-        NodeSeq = case lists:keyfind(Node, 1, NodeSeqs) of
-            {Node, PS} -> PS;
-            false -> 0
-        end,
-        case NodeSeq of
-            DbPSeq ->
-                {DocId, Revs} = IdRevs,
-                NewGTG = [{DocId, Rev} || Rev <- Revs] ++ GoodToGo,
-                {NewGTG, MaybeGood};
-            _ when NodeSeq >= DbPSeq - Lag ->
-                {GoodToGo, [{NodeSeq, IdRevs} | MaybeGood]};
-            _ ->
-                % The remote node `Node` is so far out of date
-                % we'll just ignore its read-repair updates rather
-                % than scan an unbounded number of purge infos
-                {GoodToGo, MaybeGood}
-        end
-    end,
-    {TotesGood, NeedChecking} = lists:foldl(CheckSeqFun, {[], []}, NodeIdRevs),
-
-    % For any node that's not up to date with internal
-    % replication we have to check if any of the revisions
-    % have been purged before running our updates
-    RestGood = if NeedChecking == [] -> []; true ->
-        CheckFoldFun = fun({PSeq, _UUID, DocId, Revs}, Acc) ->
-            FilterFun = fun({NS, {FiltDocId, FiltRev}}) ->
-                % The `NS =< PSeq` portion of this translates to the
-                % fact that we haven't yet replicated PSeq to the
-                % target node, hence we would need to filter this read
-                % repair update or risk undoing a purge operation.
-                NS =< PSeq andalso FiltDocId == DocId
-                        andalso lists:member(FiltRev, Revs)
-            end,
-            {ok, lists:filter(FilterFun, Acc)}
-        end,
-        StartSeq = lists:min([S || {S, _} <- NeedChecking]),
-        {ok, Result} = couch_db:fold_purge_infos(
-                Db, StartSeq, CheckFoldFun, NeedChecking),
-        [{DocId, Rev} || {_NSeq, DocId, Rev} <- Result]
-    end,
-
-    % Finally, only return docs that have a revision that
-    % has not been filtered out of the initial set
-    AllGood = lists:usort(TotesGood ++ RestGood),
-    DocFiltFun = fun(#doc{id = Id, revs = {Pos, [Rev | _]}}) ->
-        lists:member({Id, {Pos, Rev}}, AllGood)
-    end,
-    lists:filter(DocFiltFun, Docs).
 
 
 get_or_create_db(DbName, Options) ->
