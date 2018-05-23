@@ -323,23 +323,21 @@ handle_message_reply_test() ->
     Acc0 = #acc{workers=Workers, r=2, replies=[]},
 
     % Test that we continue when we haven't met R yet
-    ?assertEqual(
-        {ok, Acc0#acc{
+    ?assertMatch(
+        {ok, #acc{
             workers=[Worker0, Worker1],
-            replies=[fabric_util:kv(foo,1)],
-            node_id_revs=[]
+            replies=[{foo, {foo, 1}}]
         }},
         handle_message(foo, Worker2, Acc0)
     ),
 
-    ?assertEqual(
-        {ok, Acc0#acc{
+    ?assertMatch(
+        {ok, #acc{
             workers=[Worker0, Worker1],
-            replies=[fabric_util:kv(bar,1), fabric_util:kv(foo,1)],
-            node_id_revs=[]
+            replies=[{bar, {bar, 1}}, {foo, {foo, 1}}]
         }},
         handle_message(bar, Worker2, Acc0#acc{
-            replies=[fabric_util:kv(foo,1)]
+            replies=[{foo, {foo, 1}}]
         })
     ),
 
@@ -347,66 +345,60 @@ handle_message_reply_test() ->
     % isn't set and state remains unchanged and {stop, NewAcc}
     % is returned. Bit subtle on the assertions here.
 
-    ?assertEqual(
-        {stop, Acc0#acc{workers=[],replies=[fabric_util:kv(foo,1)]}},
+    ?assertMatch(
+        {stop, #acc{workers=[], replies=[{foo, {foo, 1}}]}},
         handle_message(foo, Worker0, Acc0#acc{workers=[Worker0]})
     ),
 
-    ?assertEqual(
-        {stop, Acc0#acc{
+    ?assertMatch(
+        {stop, #acc{
             workers=[],
-            replies=[fabric_util:kv(bar,1), fabric_util:kv(foo,1)],
-             node_id_revs =[{undefined, foo}]
+            replies=[{bar, {bar, 1}}, {foo, {foo, 1}}]
         }},
         handle_message(bar, Worker0, Acc0#acc{
             workers=[Worker0],
-            replies=[fabric_util:kv(foo,1)],
-            node_id_revs=[{undefined, foo}]
+            replies=[{foo, {foo, 1}}]
         })
     ),
 
     % Check that when R is met we stop with a new state and
     % a q_reply.
 
-    ?assertEqual(
-        {stop, Acc0#acc{
+    ?assertMatch(
+        {stop, #acc{
             workers=[],
-            replies=[fabric_util:kv(foo,2)],
+            replies=[{foo, {foo, 2}}],
             state=r_met,
-            q_reply=foo,
-            node_id_revs =[{undefined, foo}]
+            q_reply=foo
         }},
         handle_message(foo, Worker1, Acc0#acc{
             workers=[Worker0, Worker1],
-            replies=[fabric_util:kv(foo,1)],
-            node_id_revs =[{undefined, foo}]
+            replies=[{foo, {foo, 1}}]
         })
     ),
 
     ?assertEqual(
-        {stop, Acc0#acc{
+        {stop, #acc{
             workers=[],
             r=1,
-            replies=[fabric_util:kv(foo,1)],
+            replies=[{foo, {foo, 1}}],
             state=r_met,
             q_reply=foo,
-            node_id_revs =[]
+            node_revs =[]
         }},
         handle_message(foo, Worker0, Acc0#acc{r=1})
     ),
 
-    ?assertEqual(
-        {stop, Acc0#acc{
+    ?assertMatch(
+        {stop, #acc{
             workers=[],
-            replies=[fabric_util:kv(bar,1), fabric_util:kv(foo,2)],
+            replies=[{bar, {bar, 1}}, {foo, {foo, 2}}],
             state=r_met,
-            q_reply=foo,
-            node_id_revs =[{undefined, foo}, {undefined, bar}]
+            q_reply=foo
         }},
         handle_message(foo, Worker0, Acc0#acc{
             workers=[Worker0],
-            replies=[fabric_util:kv(bar,1), fabric_util:kv(foo,1)],
-            node_id_revs =[{undefined, foo}, {undefined, bar}]
+            replies=[{bar, {bar, 1}}, {foo, {foo, 1}}]
         })
     ),
 
